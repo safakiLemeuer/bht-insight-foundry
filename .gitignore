@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.json
+local.settings.json
+
+# Azure / IaC generated files
+.azure/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+!*.example.tfvars
+
+# IDE / OS
+.vscode/*.log
+.DS_Store
+Thumbs.db
+
+# Logs and local data
+*.log
+data/private/
+sample-data/private/
