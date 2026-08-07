@@ -115,6 +115,53 @@ function Show-ModelAvailability {
     return $true
 }
 
+function Invoke-ModelDeploymentWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$AccountName,
+        [Parameter(Mandatory)][string]$DeploymentName,
+        [Parameter(Mandatory)][string]$ModelName,
+        [Parameter(Mandatory)][string]$ModelVersion,
+        [Parameter(Mandatory)][int]$Capacity,
+        [string]$SkuName = "Standard",
+        [int]$MaxAttempts = 6
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Host "  Deploying '$DeploymentName' ($ModelName $ModelVersion, $SkuName capacity $Capacity) - attempt $attempt/$MaxAttempts..." -ForegroundColor Cyan
+
+        $output = (& az cognitiveservices account deployment create `
+            --resource-group $ResourceGroup `
+            --name $AccountName `
+            --deployment-name $DeploymentName `
+            --model-name $ModelName `
+            --model-version $ModelVersion `
+            --model-format OpenAI `
+            --sku-name $SkuName `
+            --sku-capacity $Capacity `
+            --output json 2>&1 | Out-String).Trim()
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  OK: '$DeploymentName' deployed." -ForegroundColor Green
+            return
+        }
+
+        $isParentConflict = $output -match "RequestConflict|Another operation is being performed on the parent resource"
+        $isTransientConnection = $output -match "10054|ConnectionResetError|Connection aborted|forcibly closed|timed out|timeout"
+
+        if (($isParentConflict -or $isTransientConnection) -and $attempt -lt $MaxAttempts) {
+            $delay = [Math]::Min(30, 5 * $attempt)
+            Write-Warning "Transient deployment conflict/connection condition. Waiting $delay seconds before retrying '$DeploymentName'."
+            Start-Sleep -Seconds $delay
+            continue
+        }
+
+        if ($output) {
+            Write-Host $output -ForegroundColor Red
+        }
+        throw "Model deployment '$DeploymentName' failed after $attempt attempt(s)."
+    }
+}
+
 if (-not (Test-Path ".\infra\bicep\main.bicep")) {
     throw "Run this script from the repository root."
 }
@@ -199,7 +246,7 @@ if (-not $DeployModels) {
         Write-Host "Both requested models are present in the account catalog." -ForegroundColor Green
     }
     else {
-        Write-Host "One or more model catalog checks were inconclusive; ARM deployment remains authoritative." -ForegroundColor Yellow
+        Write-Host "One or more model catalog checks were inconclusive; Azure deployment remains authoritative." -ForegroundColor Yellow
     }
     Write-Host "No models were deployed." -ForegroundColor Yellow
     Write-Host "Deploy with:" -ForegroundColor Cyan
@@ -207,35 +254,24 @@ if (-not $DeployModels) {
     exit 0
 }
 
-Write-Host "`nDeploying chat and embedding models..." -ForegroundColor Cyan
-$deploymentName = "phase1a-models"
-& az deployment group create `
-    --resource-group $ResourceGroup `
-    --name $deploymentName `
-    --template-file .\infra\bicep\main.bicep `
-    --parameters `
-        location=$Location `
-        searchLocation=$SearchLocation `
-        environment=$Environment `
-        uniqueSuffix=$UniqueSuffix `
-        deployModels=true `
-        chatModelName=$ChatModelName `
-        chatModelVersion=$ChatModelVersion `
-        chatModelCapacity=$ChatModelCapacity `
-        embeddingModelName=$EmbeddingModelName `
-        embeddingModelVersion=$EmbeddingModelVersion `
-        embeddingModelCapacity=$EmbeddingModelCapacity `
-    --output json
+Write-Host "`nDeploying chat and embedding models sequentially..." -ForegroundColor Cyan
+Write-Host "The deployments are serialized because Microsoft.CognitiveServices can reject concurrent child writes to the same Foundry account." -ForegroundColor DarkGray
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nFailed model deployment operations:" -ForegroundColor Yellow
-    & az deployment operation group list `
-        --resource-group $ResourceGroup `
-        --name $deploymentName `
-        --query "[?properties.provisioningState=='Failed'].{Resource:properties.targetResource.resourceName,Type:properties.targetResource.resourceType,Status:properties.statusMessage}" `
-        --output table
-    throw "Model deployment failed. ARM has provided the authoritative model/quota/capacity result above."
-}
+Invoke-ModelDeploymentWithRetry `
+    -AccountName $foundryName `
+    -DeploymentName "chat-bht-insight" `
+    -ModelName $ChatModelName `
+    -ModelVersion $ChatModelVersion `
+    -Capacity $ChatModelCapacity
+
+Start-Sleep -Seconds 5
+
+Invoke-ModelDeploymentWithRetry `
+    -AccountName $foundryName `
+    -DeploymentName "embed-bht-insight" `
+    -ModelName $EmbeddingModelName `
+    -ModelVersion $EmbeddingModelVersion `
+    -Capacity $EmbeddingModelCapacity
 
 Write-Host "`nVerifying model deployments..." -ForegroundColor Cyan
 $deployments = Invoke-AzJson -Arguments @(
