@@ -320,18 +320,13 @@ resource search 'Microsoft.Search/searchServices@2023-11-01' = {
     name: searchSku
   }
   properties: {
-    authOptions: {
-      aadOrApiKey: {
-        aadAuthFailureMode: 'http401WithBearerChallenge'
-      }
-    }
     disableLocalAuth: true
     encryptionWithCmk: {
       enforcement: 'Unspecified'
     }
     hostingMode: 'default'
     partitionCount: 1
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: 'enabled'
     replicaCount: environment == 'prod' ? 2 : 1
     semanticSearch: 'free'
   }
@@ -340,6 +335,8 @@ resource search 'Microsoft.Search/searchServices@2023-11-01' = {
 // -----------------------------------------------------------------------------
 // Key Vault is present only for integrations that cannot use managed identity.
 // The Phase 1A Azure-to-Azure path itself is keyless.
+// Purge protection is enabled only for prod; omitting the property in dev/test
+// preserves easy cleanup because the service rejects an explicit false value.
 // -----------------------------------------------------------------------------
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: keyVaultName
@@ -348,7 +345,6 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   properties: {
     tenantId: tenant().tenantId
     enableRbacAuthorization: true
-    enablePurgeProtection: environment == 'prod'
     enableSoftDelete: true
     publicNetworkAccess: 'Enabled'
     sku: {
@@ -356,6 +352,9 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
       name: 'standard'
     }
     softDeleteRetentionInDays: 7
+    ...(environment == 'prod' ? {
+      enablePurgeProtection: true
+    } : {})
   }
 }
 
