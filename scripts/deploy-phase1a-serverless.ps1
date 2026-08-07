@@ -48,7 +48,7 @@ function Invoke-AzCommandWithRetry {
             throw "Azure CLI command failed after $attempt attempt(s): az $($Arguments -join ' ')"
         }
 
-        $delay = $InitialDelaySeconds * [math]::Pow(2, $attempt - 1)
+        $delay = [int]($InitialDelaySeconds * [math]::Pow(2, $attempt - 1))
         Write-Warning "Transient Azure CLI connection failure on attempt $attempt/$MaxAttempts. Retrying in $delay second(s)..."
         Start-Sleep -Seconds $delay
     }
@@ -198,12 +198,13 @@ $parameters = @(
 )
 
 Write-Host "Running Azure what-if..." -ForegroundColor Cyan
-$whatIfOutput = Invoke-AzCommandWithRetry -Arguments @(
+$whatIfArgs = @(
     "deployment", "group", "what-if",
     "--resource-group", $ResourceGroup,
     "--template-file", ".\infra\bicep\main.bicep",
     "--parameters"
 ) + $parameters
+$whatIfOutput = Invoke-AzCommandWithRetry -Arguments $whatIfArgs
 
 if ($whatIfOutput) {
     Write-Host $whatIfOutput
@@ -219,13 +220,14 @@ if (-not $Deploy) {
 }
 
 Write-Host "Deploying Phase 1A serverless foundation..." -ForegroundColor Cyan
-$deploymentOutput = Invoke-AzCommandWithRetry -Arguments @(
+$deploymentArgs = @(
     "deployment", "group", "create",
     "--resource-group", $ResourceGroup,
     "--name", "phase1a-serverless",
     "--template-file", ".\infra\bicep\main.bicep",
     "--parameters"
 ) + $parameters + @("--output", "json")
+$deploymentOutput = Invoke-AzCommandWithRetry -Arguments $deploymentArgs
 
 if ($deploymentOutput) {
     Write-Host $deploymentOutput
