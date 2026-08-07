@@ -1,7 +1,10 @@
 targetScope = 'resourceGroup'
 
-@description('Azure region. Keep Foundry, Azure AI Search, and Functions together when supported.')
+@description('Primary Azure region for Foundry, Functions, storage, observability, and the demo web tier.')
 param location string = resourceGroup().location
+
+@description('Azure AI Search region. Defaults to the primary region but can be overridden when regional Search capacity is constrained.')
+param searchLocation string = location
 
 @description('Deployment environment name.')
 @allowed([
@@ -307,11 +310,12 @@ resource embeddingDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
 }
 
 // -----------------------------------------------------------------------------
-// Azure AI Search for hybrid/vector RAG retrieval.
+// Azure AI Search for hybrid/vector RAG retrieval. Search can be placed in a
+// separate region from the rest of the demo when capacity is constrained.
 // -----------------------------------------------------------------------------
 resource search 'Microsoft.Search/searchServices@2023-11-01' = {
   name: searchName
-  location: location
+  location: searchLocation
   tags: tags
   identity: {
     type: 'SystemAssigned'
@@ -582,6 +586,7 @@ output foundryAccountName string = foundry.name
 output foundryProjectName string = foundryProject.name
 output foundryEndpoint string = foundry.properties.endpoint
 output searchServiceName string = search.name
+output searchRegion string = searchLocation
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
 output knowledgeStorageAccountName string = knowledgeStorage.name
 output functionStorageAccountName string = functionStorage.name
