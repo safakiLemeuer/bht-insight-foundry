@@ -19,12 +19,47 @@ function Assert-Command {
     }
 }
 
+function Test-TransientAzureCliError {
+    param([string]$Text)
+
+    return $Text -match "10054|ConnectionResetError|Connection aborted|forcibly closed|temporarily unavailable|timed out|timeout"
+}
+
+function Invoke-AzCommandWithRetry {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [int]$MaxAttempts = 4,
+        [int]$InitialDelaySeconds = 2
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $output = (& az @Arguments 2>&1 | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -eq 0) {
+            return $output
+        }
+
+        $isTransient = Test-TransientAzureCliError -Text $output
+        if (-not $isTransient -or $attempt -eq $MaxAttempts) {
+            if ($output) {
+                Write-Host $output -ForegroundColor Red
+            }
+            throw "Azure CLI command failed after $attempt attempt(s): az $($Arguments -join ' ')"
+        }
+
+        $delay = $InitialDelaySeconds * [math]::Pow(2, $attempt - 1)
+        Write-Warning "Transient Azure CLI connection failure on attempt $attempt/$MaxAttempts. Retrying in $delay second(s)..."
+        Start-Sleep -Seconds $delay
+    }
+}
+
 function Invoke-AzJson {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
-    $result = & az @Arguments --output json
-    if ($LASTEXITCODE -ne 0) {
-        throw "Azure CLI command failed: az $($Arguments -join ' ')"
+    $result = Invoke-AzCommandWithRetry -Arguments ($Arguments + @("--output", "json"))
+    if ([string]::IsNullOrWhiteSpace($result)) {
+        return $null
     }
     return $result | ConvertFrom-Json
 }
@@ -72,7 +107,7 @@ if ([string]::IsNullOrWhiteSpace($UniqueSuffix)) {
     Write-Host "Generated unique suffix: $UniqueSuffix" -ForegroundColor Yellow
 }
 
-Write-Host "Registering required Azure resource providers..." -ForegroundColor Cyan
+Write-Host "Checking required Azure resource providers..." -ForegroundColor Cyan
 $providers = @(
     "Microsoft.CognitiveServices",
     "Microsoft.Search",
@@ -85,27 +120,68 @@ $providers = @(
 )
 
 foreach ($provider in $providers) {
-    & az provider register --namespace $provider --output none
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to register resource provider '$provider'."
+    $state = (Invoke-AzCommandWithRetry -Arguments @(
+        "provider", "show",
+        "--namespace", $provider,
+        "--query", "registrationState",
+        "--output", "tsv"
+    )).Trim()
+
+    if ($state -eq "Registered") {
+        Write-Host "  $provider : Registered" -ForegroundColor Green
+        continue
+    }
+
+    Write-Host "  $provider : $state -> registering" -ForegroundColor Yellow
+    Invoke-AzCommandWithRetry -Arguments @(
+        "provider", "register",
+        "--namespace", $provider,
+        "--output", "none"
+    ) | Out-Null
+
+    $registered = $false
+    for ($check = 1; $check -le 12; $check++) {
+        $state = (Invoke-AzCommandWithRetry -Arguments @(
+            "provider", "show",
+            "--namespace", $provider,
+            "--query", "registrationState",
+            "--output", "tsv"
+        )).Trim()
+
+        if ($state -eq "Registered") {
+            $registered = $true
+            Write-Host "  $provider : Registered" -ForegroundColor Green
+            break
+        }
+
+        Write-Host "  $provider : $state (waiting...)" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 5
+    }
+
+    if (-not $registered) {
+        throw "Resource provider '$provider' did not reach Registered state within the expected time."
     }
 }
 
-$existingGroup = & az group exists --name $ResourceGroup
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to check resource group '$ResourceGroup'."
-}
+$existingGroup = (Invoke-AzCommandWithRetry -Arguments @(
+    "group", "exists",
+    "--name", $ResourceGroup,
+    "--output", "tsv"
+)).Trim()
 
-if ($existingGroup.Trim().ToLowerInvariant() -ne "true") {
+if ($existingGroup.ToLowerInvariant() -ne "true") {
     Write-Host "Creating resource group $ResourceGroup in $Location..." -ForegroundColor Cyan
-    & az group create `
-        --name $ResourceGroup `
-        --location $Location `
-        --tags Application="BHT Insight Foundry" Environment=$Environment Phase="1A" ManagedBy="Bicep" `
-        --output none
-    if ($LASTEXITCODE -ne 0) {
-        throw "Resource group creation failed."
-    }
+    Invoke-AzCommandWithRetry -Arguments @(
+        "group", "create",
+        "--name", $ResourceGroup,
+        "--location", $Location,
+        "--tags",
+        "Application=BHT Insight Foundry",
+        "Environment=$Environment",
+        "Phase=1A",
+        "ManagedBy=Bicep",
+        "--output", "none"
+    ) | Out-Null
 }
 
 Write-Host "Compiling Bicep..." -ForegroundColor Cyan
@@ -122,16 +198,19 @@ $parameters = @(
 )
 
 Write-Host "Running Azure what-if..." -ForegroundColor Cyan
-& az deployment group what-if `
-    --resource-group $ResourceGroup `
-    --template-file .\infra\bicep\main.bicep `
-    --parameters @parameters
-if ($LASTEXITCODE -ne 0) {
-    throw "Azure what-if failed. Nothing was deployed."
+$whatIfOutput = Invoke-AzCommandWithRetry -Arguments @(
+    "deployment", "group", "what-if",
+    "--resource-group", $ResourceGroup,
+    "--template-file", ".\infra\bicep\main.bicep",
+    "--parameters"
+) + $parameters
+
+if ($whatIfOutput) {
+    Write-Host $whatIfOutput
 }
 
 if (-not $Deploy) {
-    Write-Host "" 
+    Write-Host ""
     Write-Host "Preflight and what-if completed successfully." -ForegroundColor Green
     Write-Host "No infrastructure was deployed." -ForegroundColor Yellow
     Write-Host "Review the what-if output, then deploy with:" -ForegroundColor Cyan
@@ -140,17 +219,19 @@ if (-not $Deploy) {
 }
 
 Write-Host "Deploying Phase 1A serverless foundation..." -ForegroundColor Cyan
-& az deployment group create `
-    --resource-group $ResourceGroup `
-    --name "phase1a-serverless" `
-    --template-file .\infra\bicep\main.bicep `
-    --parameters @parameters `
-    --output json
-if ($LASTEXITCODE -ne 0) {
-    throw "Infrastructure deployment failed. Inspect the Azure deployment operation before retrying."
+$deploymentOutput = Invoke-AzCommandWithRetry -Arguments @(
+    "deployment", "group", "create",
+    "--resource-group", $ResourceGroup,
+    "--name", "phase1a-serverless",
+    "--template-file", ".\infra\bicep\main.bicep",
+    "--parameters"
+) + $parameters + @("--output", "json")
+
+if ($deploymentOutput) {
+    Write-Host $deploymentOutput
 }
 
-Write-Host "" 
+Write-Host ""
 Write-Host "Phase 1A serverless foundation deployed." -ForegroundColor Green
 Write-Host "Models are intentionally NOT deployed yet. Model/version/quota will be verified separately." -ForegroundColor Yellow
 Write-Host "Next: deploy frontend/API code, then link the standalone Function App to Static Web Apps." -ForegroundColor Cyan
