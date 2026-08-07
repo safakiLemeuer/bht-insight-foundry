@@ -64,6 +64,37 @@ function Invoke-AzJson {
     return $result | ConvertFrom-Json
 }
 
+function Show-FailedDeploymentOperations {
+    param(
+        [Parameter(Mandatory)][string]$ResourceGroupName,
+        [Parameter(Mandatory)][string]$DeploymentName
+    )
+
+    Write-Host "" 
+    Write-Host "Failed Azure deployment operations:" -ForegroundColor Yellow
+
+    try {
+        $failed = & az deployment operation group list `
+            --resource-group $ResourceGroupName `
+            --name $DeploymentName `
+            --query "[?properties.provisioningState=='Failed'].{Resource:properties.targetResource.resourceName,Type:properties.targetResource.resourceType,Status:properties.statusMessage}" `
+            --output json 2>$null
+
+        if ($LASTEXITCODE -eq 0 -and $failed) {
+            $items = $failed | ConvertFrom-Json
+            if ($items.Count -gt 0) {
+                $items | Format-List | Out-String | Write-Host
+                return
+            }
+        }
+    }
+    catch {
+        # Preserve the original deployment exception; diagnostics are best effort.
+    }
+
+    Write-Host "No failed operation details could be retrieved automatically." -ForegroundColor DarkYellow
+}
+
 Assert-Command az
 
 if (-not (Test-Path ".\infra\bicep\main.bicep")) {
@@ -105,6 +136,10 @@ if (-not $runtimeSupported) {
 if ([string]::IsNullOrWhiteSpace($UniqueSuffix)) {
     $UniqueSuffix = [System.Guid]::NewGuid().ToString("N").Substring(0, 5)
     Write-Host "Generated unique suffix: $UniqueSuffix" -ForegroundColor Yellow
+}
+
+if ($UniqueSuffix -notmatch '^[a-z0-9]{3,8}$') {
+    throw "UniqueSuffix must be 3-8 lowercase letters or numbers. Received '$UniqueSuffix'."
 }
 
 Write-Host "Checking required Azure resource providers..." -ForegroundColor Cyan
@@ -191,13 +226,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $parameters = @(
+    "location=$Location",
     "environment=$Environment",
     "uniqueSuffix=$UniqueSuffix",
     "deployModels=false",
     "functionPythonVersion=$PythonVersion"
 )
 
-Write-Host "Running Azure what-if..." -ForegroundColor Cyan
+Write-Host "Running Azure what-if for resource location '$Location'..." -ForegroundColor Cyan
 $whatIfArgs = @(
     "deployment", "group", "what-if",
     "--resource-group", $ResourceGroup,
@@ -219,15 +255,23 @@ if (-not $Deploy) {
     exit 0
 }
 
-Write-Host "Deploying Phase 1A serverless foundation..." -ForegroundColor Cyan
+$deploymentName = "phase1a-serverless"
+Write-Host "Deploying Phase 1A serverless foundation to '$Location'..." -ForegroundColor Cyan
 $deploymentArgs = @(
     "deployment", "group", "create",
     "--resource-group", $ResourceGroup,
-    "--name", "phase1a-serverless",
+    "--name", $deploymentName,
     "--template-file", ".\infra\bicep\main.bicep",
     "--parameters"
 ) + $parameters + @("--output", "json")
-$deploymentOutput = Invoke-AzCommandWithRetry -Arguments $deploymentArgs
+
+try {
+    $deploymentOutput = Invoke-AzCommandWithRetry -Arguments $deploymentArgs
+}
+catch {
+    Show-FailedDeploymentOperations -ResourceGroupName $ResourceGroup -DeploymentName $deploymentName
+    throw
+}
 
 if ($deploymentOutput) {
     Write-Host $deploymentOutput
