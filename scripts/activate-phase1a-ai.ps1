@@ -59,34 +59,60 @@ function Test-RoleAssignment {
     return $true
 }
 
-function Show-ModelCatalogHint {
+function Get-AccountModelMatch {
     param(
+        [Parameter(Mandatory)][object[]]$Models,
+        [Parameter(Mandatory)][string]$ModelName,
+        [Parameter(Mandatory)][string]$ModelVersion
+    )
+
+    return @(
+        $Models | Where-Object {
+            $topLevelMatch = (
+                $_.name -eq $ModelName -and
+                $_.version -eq $ModelVersion -and
+                ($null -eq $_.format -or $_.format -eq "OpenAI")
+            )
+
+            $nestedMatch = (
+                $null -ne $_.model -and
+                $_.model.name -eq $ModelName -and
+                $_.model.version -eq $ModelVersion
+            )
+
+            $topLevelMatch -or $nestedMatch
+        }
+    )
+}
+
+function Show-ModelAvailability {
+    param(
+        [Parameter(Mandatory)][object[]]$Models,
         [Parameter(Mandatory)][string]$ModelName,
         [Parameter(Mandatory)][string]$ModelVersion,
         [Parameter(Mandatory)][string]$LocationName
     )
 
-    Write-Host "  Requested: $ModelName $ModelVersion" -ForegroundColor Cyan
+    $matches = Get-AccountModelMatch -Models $Models -ModelName $ModelName -ModelVersion $ModelVersion
 
-    try {
-        $catalog = & az cognitiveservices model list `
-            --location $LocationName `
-            --query "[?name=='$ModelName' && version=='$ModelVersion']" `
-            --output json 2>$null
-
-        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($catalog | Out-String))) {
-            $matches = ($catalog | Out-String) | ConvertFrom-Json
-            if (@($matches).Count -gt 0) {
-                Write-Host "  Catalog:   visible in $LocationName" -ForegroundColor Green
-                return
-            }
-        }
-    }
-    catch {
-        # Catalog discovery is advisory only. ARM deployment is authoritative.
+    if ($matches.Count -eq 0) {
+        Write-Warning "Model '$ModelName' version '$ModelVersion' was not found in the account model catalog for $LocationName. ARM deployment remains authoritative."
+        return $false
     }
 
-    Write-Warning "CLI catalog did not positively match $ModelName $ModelVersion in $LocationName. This is advisory; ARM deployment will be the source of truth."
+    $match = $matches[0]
+    $skuNames = @($match.skus | ForEach-Object { $_.name } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $lifecycle = if ($match.lifecycleStatus) { $match.lifecycleStatus } else { "Unknown" }
+    $format = if ($match.format) { $match.format } else { "Unknown" }
+
+    Write-Host "  OK: $ModelName $ModelVersion" -ForegroundColor Green
+    Write-Host "      Format:    $format"
+    Write-Host "      Lifecycle: $lifecycle"
+    if ($skuNames.Count -gt 0) {
+        Write-Host "      SKUs:      $($skuNames -join ', ')"
+    }
+
+    return $true
 }
 
 if (-not (Test-Path ".\infra\bicep\main.bicep")) {
@@ -157,13 +183,25 @@ if ($checks -contains $false) {
     throw "One or more required RBAC assignments are missing. Re-run the Phase 1A infrastructure deployment and allow time for RBAC propagation."
 }
 
-Write-Host "`nChecking requested model versions (advisory)..." -ForegroundColor Cyan
-Show-ModelCatalogHint -ModelName $ChatModelName -ModelVersion $ChatModelVersion -LocationName $Location
-Show-ModelCatalogHint -ModelName $EmbeddingModelName -ModelVersion $EmbeddingModelVersion -LocationName $Location
+Write-Host "`nChecking model/version availability from the Foundry account..." -ForegroundColor Cyan
+$models = @(Invoke-AzJson -Arguments @(
+    "cognitiveservices", "account", "list-models",
+    "--resource-group", $ResourceGroup,
+    "--name", $foundryName
+))
+
+$chatVisible = Show-ModelAvailability -Models $models -ModelName $ChatModelName -ModelVersion $ChatModelVersion -LocationName $Location
+$embeddingVisible = Show-ModelAvailability -Models $models -ModelName $EmbeddingModelName -ModelVersion $EmbeddingModelVersion -LocationName $Location
 
 if (-not $DeployModels) {
     Write-Host "`nRBAC checks passed." -ForegroundColor Green
-    Write-Host "Model catalog discovery is advisory; no models were deployed." -ForegroundColor Yellow
+    if ($chatVisible -and $embeddingVisible) {
+        Write-Host "Both requested models are present in the account catalog." -ForegroundColor Green
+    }
+    else {
+        Write-Host "One or more model catalog checks were inconclusive; ARM deployment remains authoritative." -ForegroundColor Yellow
+    }
+    Write-Host "No models were deployed." -ForegroundColor Yellow
     Write-Host "Deploy with:" -ForegroundColor Cyan
     Write-Host ".\scripts\activate-phase1a-ai.ps1 -ResourceGroup '$ResourceGroup' -Location '$Location' -SearchLocation '$SearchLocation' -Environment '$Environment' -UniqueSuffix '$UniqueSuffix' -DeployModels"
     exit 0
