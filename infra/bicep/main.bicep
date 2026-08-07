@@ -1,6 +1,6 @@
 targetScope = 'resourceGroup'
 
-@description('Azure region. Keep Foundry, Azure AI Search, and the application in the same region when supported.')
+@description('Azure region. Keep Foundry, Azure AI Search, and Functions together when supported.')
 param location string = resourceGroup().location
 
 @description('Deployment environment name.')
@@ -16,38 +16,51 @@ param environment string = 'dev'
 @maxLength(8)
 param uniqueSuffix string
 
-@description('Whether to deploy model deployments. Set false until model availability and quota are verified in the target region.')
+@description('Whether to deploy model deployments. Keep false until regional model availability and quota are verified.')
 param deployModels bool = false
 
 @description('Chat model name available in the selected region.')
 param chatModelName string = 'gpt-4.1-mini'
 
-@description('Chat model version available in the selected region.')
+@description('Chat model version. Supply an available version when deployModels is true.')
 param chatModelVersion string = ''
 
-@description('Chat model deployment capacity in thousands of tokens per minute for Standard SKU.')
+@description('Chat model Standard deployment capacity in thousands of tokens per minute.')
 @minValue(1)
 param chatModelCapacity int = 10
 
-@description('Embedding model name supported by Azure AI Search integrated vectorization.')
+@description('Embedding model name.')
 param embeddingModelName string = 'text-embedding-3-small'
 
-@description('Embedding model version available in the selected region.')
+@description('Embedding model version. Supply an available version when deployModels is true.')
 param embeddingModelVersion string = '1'
 
-@description('Embedding model deployment capacity in thousands of tokens per minute for Standard SKU.')
+@description('Embedding model Standard deployment capacity in thousands of tokens per minute.')
 @minValue(1)
 param embeddingModelCapacity int = 10
 
-@description('Linux App Service Plan SKU.')
-param appServicePlanSku string = 'B1'
-
-@description('Azure AI Search SKU. Basic or higher is required for managed identity outbound connections.')
+@description('Azure AI Search SKU.')
 @allowed([
   'basic'
   'standard'
 ])
 param searchSku string = 'basic'
+
+@description('Python version for the Azure Functions Flex Consumption runtime. Verify the version in the target region before deployment.')
+param functionPythonVersion string = '3.12'
+
+@description('Maximum Flex Consumption instances. Keep intentionally low for the Phase 1A development environment.')
+@minValue(1)
+@maxValue(1000)
+param functionMaximumInstanceCount int = 20
+
+@description('Memory allocated to each Flex Consumption instance in MB.')
+@allowed([
+  512
+  2048
+  4096
+])
+param functionInstanceMemoryMB int = 2048
 
 var workload = 'bhtinsight'
 var compactPrefix = '${workload}${environment}${uniqueSuffix}'
@@ -57,25 +70,33 @@ var tags = {
   environment: environment
   managedBy: 'Bicep'
   phase: '1A'
+  hostingModel: 'Serverless'
   dataClassification: 'Demonstration'
 }
 
-var storageName = take(replace('st${compactPrefix}', '-', ''), 24)
+var knowledgeStorageName = take(replace('st${compactPrefix}', '-', ''), 24)
+var functionStorageName = take(replace('stfn${compactPrefix}', '-', ''), 24)
 var keyVaultName = take('kv-${standardPrefix}', 24)
 var foundryName = take('ai-${standardPrefix}', 64)
 var foundryProjectName = take('proj-${standardPrefix}', 64)
 var searchName = take('srch-${standardPrefix}', 60)
-var appServicePlanName = 'asp-${standardPrefix}'
-var webAppName = take('app-${standardPrefix}', 60)
+var functionPlanName = take('fc-${standardPrefix}', 40)
+var functionAppName = take('func-${standardPrefix}', 60)
+var staticWebAppName = take('swa-${standardPrefix}', 60)
 var logAnalyticsName = 'log-${standardPrefix}'
 var appInsightsName = 'appi-${standardPrefix}'
 
-// Built-in role definition IDs.
+// Azure built-in role definition IDs.
 var storageBlobDataReaderRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+var storageBlobDataOwnerRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b')
 var searchIndexDataReaderRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '1407120a-92aa-4202-b7e9-c0e197c71c8f')
 var cognitiveServicesOpenAIUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
 var keyVaultSecretsUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+var monitoringMetricsPublisherRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
 
+// -----------------------------------------------------------------------------
+// Observability
+// -----------------------------------------------------------------------------
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logAnalyticsName
   location: location
@@ -105,8 +126,12 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
-resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
-  name: storageName
+// -----------------------------------------------------------------------------
+// Enterprise knowledge storage. This account stores approved source documents.
+// It is intentionally separate from the Azure Functions runtime storage.
+// -----------------------------------------------------------------------------
+resource knowledgeStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: knowledgeStorageName
   location: location
   tags: tags
   sku: {
@@ -117,6 +142,7 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     accessTier: 'Hot'
     allowBlobPublicAccess: false
     allowCrossTenantReplication: false
+    allowSharedKeyAccess: false
     defaultToOAuthAuthentication: true
     minimumTlsVersion: 'TLS1_2'
     publicNetworkAccess: 'Enabled'
@@ -128,9 +154,9 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   }
 }
 
-resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+resource knowledgeBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   name: 'default'
-  parent: storage
+  parent: knowledgeStorage
   properties: {
     deleteRetentionPolicy: {
       enabled: true
@@ -145,7 +171,7 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
 
 resource approvedContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   name: 'documents-approved'
-  parent: blobService
+  parent: knowledgeBlobService
   properties: {
     publicAccess: 'None'
   }
@@ -153,7 +179,7 @@ resource approvedContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
 
 resource quarantineContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   name: 'documents-quarantine'
-  parent: blobService
+  parent: knowledgeBlobService
   properties: {
     publicAccess: 'None'
   }
@@ -161,12 +187,57 @@ resource quarantineContainer 'Microsoft.Storage/storageAccounts/blobServices/con
 
 resource rejectedContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   name: 'documents-rejected'
-  parent: blobService
+  parent: knowledgeBlobService
   properties: {
     publicAccess: 'None'
   }
 }
 
+// -----------------------------------------------------------------------------
+// Dedicated Functions runtime/deployment storage. Keeping this separate reduces
+// accidental coupling between application-runtime data and enterprise content.
+// -----------------------------------------------------------------------------
+resource functionStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: functionStorageName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    allowBlobPublicAccess: false
+    allowCrossTenantReplication: false
+    allowSharedKeyAccess: false
+    defaultToOAuthAuthentication: true
+    minimumTlsVersion: 'TLS1_2'
+    publicNetworkAccess: 'Enabled'
+    supportsHttpsTrafficOnly: true
+  }
+}
+
+resource functionBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  name: 'default'
+  parent: functionStorage
+  properties: {
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 7
+    }
+  }
+}
+
+resource deploymentContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  name: 'deployments'
+  parent: functionBlobService
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Microsoft Foundry account and project.
+// -----------------------------------------------------------------------------
 resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   name: foundryName
   location: location
@@ -197,7 +268,7 @@ resource foundryProject 'Microsoft.CognitiveServices/accounts/projects@2025-06-0
   }
   properties: {
     displayName: 'BHT Insight Phase 1A'
-    description: 'Foundry project for the BHT Insight end-to-end RAG web application.'
+    description: 'Foundry project for the BHT Insight serverless RAG web application.'
   }
 }
 
@@ -235,6 +306,9 @@ resource embeddingDeployment 'Microsoft.CognitiveServices/accounts/deployments@2
   }
 }
 
+// -----------------------------------------------------------------------------
+// Azure AI Search for hybrid/vector RAG retrieval.
+// -----------------------------------------------------------------------------
 resource search 'Microsoft.Search/searchServices@2023-11-01' = {
   name: searchName
   location: location
@@ -263,6 +337,10 @@ resource search 'Microsoft.Search/searchServices@2023-11-01' = {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Key Vault is present only for integrations that cannot use managed identity.
+// The Phase 1A Azure-to-Azure path itself is keyless.
+// -----------------------------------------------------------------------------
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: keyVaultName
   location: location
@@ -281,49 +359,72 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-resource appServicePlan 'Microsoft.Web/serverfarms@2024-04-01' = {
-  name: appServicePlanName
+// -----------------------------------------------------------------------------
+// Serverless API: Azure Functions Flex Consumption. FC1 is not the dedicated B1
+// App Service SKU that caused the Phase 1A quota block.
+// -----------------------------------------------------------------------------
+resource functionPlan 'Microsoft.Web/serverfarms@2023-12-01' = {
+  name: functionPlanName
   location: location
   tags: tags
-  kind: 'linux'
+  kind: 'functionapp'
   sku: {
-    name: appServicePlanSku
+    name: 'FC1'
+    tier: 'FlexConsumption'
   }
   properties: {
     reserved: true
-    zoneRedundant: false
   }
 }
 
-resource webApp 'Microsoft.Web/sites@2024-04-01' = {
-  name: webAppName
+resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
+  name: functionAppName
   location: location
   tags: tags
-  kind: 'app,linux'
+  kind: 'functionapp,linux'
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
-    serverFarmId: appServicePlan.id
+    serverFarmId: functionPlan.id
     httpsOnly: true
     publicNetworkAccess: 'Enabled'
+    functionAppConfig: {
+      deployment: {
+        storage: {
+          type: 'blobContainer'
+          value: '${functionStorage.properties.primaryEndpoints.blob}${deploymentContainer.name}'
+          authentication: {
+            type: 'SystemAssignedIdentity'
+          }
+        }
+      }
+      scaleAndConcurrency: {
+        maximumInstanceCount: functionMaximumInstanceCount
+        instanceMemoryMB: functionInstanceMemoryMB
+      }
+      runtime: {
+        name: 'python'
+        version: functionPythonVersion
+      }
+    }
     siteConfig: {
-      alwaysOn: appServicePlanSku != 'F1'
       ftpsState: 'Disabled'
-      http20Enabled: true
-      linuxFxVersion: 'PYTHON|3.12'
-      minimumElasticInstanceCount: 0
       minTlsVersion: '1.2'
       scmMinTlsVersion: '1.2'
-      use32BitWorkerProcess: false
+      http20Enabled: true
       appSettings: [
+        {
+          name: 'AzureWebJobsStorage__accountName'
+          value: functionStorage.name
+        }
         {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
           value: appInsights.properties.ConnectionString
         }
         {
-          name: 'ApplicationInsightsAgent_EXTENSION_VERSION'
-          value: '~3'
+          name: 'APPLICATIONINSIGHTS_AUTHENTICATION_STRING'
+          value: 'Authorization=AAD'
         }
         {
           name: 'AZURE_AI_FOUNDRY_ENDPOINT'
@@ -351,7 +452,7 @@ resource webApp 'Microsoft.Web/sites@2024-04-01' = {
         }
         {
           name: 'AZURE_STORAGE_ACCOUNT_URL'
-          value: 'https://${storage.name}.blob.core.windows.net'
+          value: knowledgeStorage.properties.primaryEndpoints.blob
         }
         {
           name: 'AZURE_STORAGE_APPROVED_CONTAINER'
@@ -361,19 +462,37 @@ resource webApp 'Microsoft.Web/sites@2024-04-01' = {
           name: 'KEY_VAULT_URL'
           value: keyVault.properties.vaultUri
         }
-        {
-          name: 'SCM_DO_BUILD_DURING_DEPLOYMENT'
-          value: 'true'
-        }
       ]
     }
   }
 }
 
-// Search indexer reads approved documents from Blob Storage.
+// -----------------------------------------------------------------------------
+// Serverless frontend. Standard is required when linking a separately managed
+// Azure Functions app as the Static Web Apps /api backend.
+// -----------------------------------------------------------------------------
+resource staticWebApp 'Microsoft.Web/staticSites@2025-03-01' = {
+  name: staticWebAppName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard'
+    tier: 'Standard'
+  }
+  properties: {
+    allowConfigFileUpdates: true
+    enterpriseGradeCdnStatus: 'Disabled'
+    stagingEnvironmentPolicy: 'Enabled'
+  }
+}
+
+// -----------------------------------------------------------------------------
+// RBAC: Azure AI Search reads approved source documents and can call the Foundry
+// embedding deployment for integrated vectorization.
+// -----------------------------------------------------------------------------
 resource searchStorageReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, search.id, storageBlobDataReaderRoleId)
-  scope: storage
+  name: guid(knowledgeStorage.id, search.id, storageBlobDataReaderRoleId)
+  scope: knowledgeStorage
   properties: {
     principalId: search.identity.principalId
     principalType: 'ServicePrincipal'
@@ -381,7 +500,6 @@ resource searchStorageReader 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 }
 
-// Search integrated vectorization calls the Foundry-hosted embedding deployment.
 resource searchFoundryUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(foundry.id, search.id, cognitiveServicesOpenAIUserRoleId)
   scope: foundry
@@ -392,61 +510,90 @@ resource searchFoundryUser 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   }
 }
 
-// Runtime web app queries Azure AI Search.
-resource webSearchReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(search.id, webApp.id, searchIndexDataReaderRoleId)
+// -----------------------------------------------------------------------------
+// RBAC: Function App runtime identity. No Azure service API keys are required.
+// -----------------------------------------------------------------------------
+resource functionSearchReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(search.id, functionApp.id, searchIndexDataReaderRoleId)
   scope: search
   properties: {
-    principalId: webApp.identity.principalId
+    principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: searchIndexDataReaderRoleId
   }
 }
 
-// Runtime web app calls the chat and embedding model endpoints without API keys.
-resource webFoundryUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(foundry.id, webApp.id, cognitiveServicesOpenAIUserRoleId)
+resource functionFoundryUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(foundry.id, functionApp.id, cognitiveServicesOpenAIUserRoleId)
   scope: foundry
   properties: {
-    principalId: webApp.identity.principalId
+    principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: cognitiveServicesOpenAIUserRoleId
   }
 }
 
-// Runtime web app can read approved documents for citation/source display.
-resource webStorageReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, webApp.id, storageBlobDataReaderRoleId)
-  scope: storage
+resource functionKnowledgeStorageReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(knowledgeStorage.id, functionApp.id, storageBlobDataReaderRoleId)
+  scope: knowledgeStorage
   properties: {
-    principalId: webApp.identity.principalId
+    principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: storageBlobDataReaderRoleId
   }
 }
 
-resource webKeyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, webApp.id, keyVaultSecretsUserRoleId)
+// Storage Blob Data Owner is the documented minimum host-storage role for an
+// identity-based AzureWebJobsStorage connection. It also covers the deployment
+// container's blob-data requirements for this Function App.
+resource functionHostStorageOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(functionStorage.id, functionApp.id, storageBlobDataOwnerRoleId)
+  scope: functionStorage
+  properties: {
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobDataOwnerRoleId
+  }
+}
+
+resource functionKeyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, functionApp.id, keyVaultSecretsUserRoleId)
   scope: keyVault
   properties: {
-    principalId: webApp.identity.principalId
+    principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: keyVaultSecretsUserRoleId
   }
 }
 
+resource functionMonitoringPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(appInsights.id, functionApp.id, monitoringMetricsPublisherRoleId)
+  scope: appInsights
+  properties: {
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: monitoringMetricsPublisherRoleId
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Outputs used by the deployment script, GitHub Actions, and local development.
+// -----------------------------------------------------------------------------
 output foundryAccountName string = foundry.name
 output foundryProjectName string = foundryProject.name
 output foundryEndpoint string = foundry.properties.endpoint
 output searchServiceName string = search.name
 output searchEndpoint string = 'https://${search.name}.search.windows.net'
-output storageAccountName string = storage.name
+output knowledgeStorageAccountName string = knowledgeStorage.name
+output functionStorageAccountName string = functionStorage.name
 output approvedContainerName string = approvedContainer.name
 output keyVaultName string = keyVault.name
 output keyVaultUri string = keyVault.properties.vaultUri
-output webAppName string = webApp.name
-output webAppUrl string = 'https://${webApp.properties.defaultHostName}'
-output webAppPrincipalId string = webApp.identity.principalId
-output searchPrincipalId string = search.identity.principalId
+output functionPlanName string = functionPlan.name
+output functionAppName string = functionApp.name
+output functionAppId string = functionApp.id
+output functionAppUrl string = 'https://${functionApp.properties.defaultHostName}'
+output staticWebAppName string = staticWebApp.name
+output staticWebAppUrl string = 'https://${staticWebApp.properties.defaultHostname}'
 output applicationInsightsName string = appInsights.name
 output logAnalyticsWorkspaceName string = logAnalytics.name
