@@ -59,6 +59,36 @@ function Test-RoleAssignment {
     return $true
 }
 
+function Show-ModelCatalogHint {
+    param(
+        [Parameter(Mandatory)][string]$ModelName,
+        [Parameter(Mandatory)][string]$ModelVersion,
+        [Parameter(Mandatory)][string]$LocationName
+    )
+
+    Write-Host "  Requested: $ModelName $ModelVersion" -ForegroundColor Cyan
+
+    try {
+        $catalog = & az cognitiveservices model list `
+            --location $LocationName `
+            --query "[?name=='$ModelName' && version=='$ModelVersion']" `
+            --output json 2>$null
+
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($catalog | Out-String))) {
+            $matches = ($catalog | Out-String) | ConvertFrom-Json
+            if (@($matches).Count -gt 0) {
+                Write-Host "  Catalog:   visible in $LocationName" -ForegroundColor Green
+                return
+            }
+        }
+    }
+    catch {
+        # Catalog discovery is advisory only. ARM deployment is authoritative.
+    }
+
+    Write-Warning "CLI catalog did not positively match $ModelName $ModelVersion in $LocationName. This is advisory; ARM deployment will be the source of truth."
+}
+
 if (-not (Test-Path ".\infra\bicep\main.bicep")) {
     throw "Run this script from the repository root."
 }
@@ -127,29 +157,13 @@ if ($checks -contains $false) {
     throw "One or more required RBAC assignments are missing. Re-run the Phase 1A infrastructure deployment and allow time for RBAC propagation."
 }
 
-Write-Host "`nChecking model/version visibility from the Foundry account..." -ForegroundColor Cyan
-$models = Invoke-AzJson -Arguments @(
-    "cognitiveservices", "account", "list-models",
-    "--resource-group", $ResourceGroup,
-    "--name", $foundryName
-)
-
-$chatMatch = @($models | Where-Object { $_.model.name -eq $ChatModelName -and $_.model.version -eq $ChatModelVersion })
-$embeddingMatch = @($models | Where-Object { $_.model.name -eq $EmbeddingModelName -and $_.model.version -eq $EmbeddingModelVersion })
-
-if ($chatMatch.Count -eq 0) {
-    throw "Model '$ChatModelName' version '$ChatModelVersion' is not visible to this Foundry account in $Location."
-}
-if ($embeddingMatch.Count -eq 0) {
-    throw "Model '$EmbeddingModelName' version '$EmbeddingModelVersion' is not visible to this Foundry account in $Location."
-}
-
-Write-Host "  OK: $ChatModelName $ChatModelVersion" -ForegroundColor Green
-Write-Host "  OK: $EmbeddingModelName $EmbeddingModelVersion" -ForegroundColor Green
+Write-Host "`nChecking requested model versions (advisory)..." -ForegroundColor Cyan
+Show-ModelCatalogHint -ModelName $ChatModelName -ModelVersion $ChatModelVersion -LocationName $Location
+Show-ModelCatalogHint -ModelName $EmbeddingModelName -ModelVersion $EmbeddingModelVersion -LocationName $Location
 
 if (-not $DeployModels) {
-    Write-Host "`nRBAC and model visibility checks passed." -ForegroundColor Green
-    Write-Host "No models were deployed." -ForegroundColor Yellow
+    Write-Host "`nRBAC checks passed." -ForegroundColor Green
+    Write-Host "Model catalog discovery is advisory; no models were deployed." -ForegroundColor Yellow
     Write-Host "Deploy with:" -ForegroundColor Cyan
     Write-Host ".\scripts\activate-phase1a-ai.ps1 -ResourceGroup '$ResourceGroup' -Location '$Location' -SearchLocation '$SearchLocation' -Environment '$Environment' -UniqueSuffix '$UniqueSuffix' -DeployModels"
     exit 0
@@ -176,7 +190,13 @@ $deploymentName = "phase1a-models"
     --output json
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Model deployment failed. Check Azure model quota/capacity for the selected deployment type."
+    Write-Host "`nFailed model deployment operations:" -ForegroundColor Yellow
+    & az deployment operation group list `
+        --resource-group $ResourceGroup `
+        --name $deploymentName `
+        --query "[?properties.provisioningState=='Failed'].{Resource:properties.targetResource.resourceName,Type:properties.targetResource.resourceType,Status:properties.statusMessage}" `
+        --output table
+    throw "Model deployment failed. ARM has provided the authoritative model/quota/capacity result above."
 }
 
 Write-Host "`nVerifying model deployments..." -ForegroundColor Cyan
