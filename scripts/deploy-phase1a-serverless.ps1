@@ -2,6 +2,7 @@
 param(
     [string]$ResourceGroup = "rg-bht-insight-dev",
     [string]$Location = "eastus2",
+    [string]$SearchLocation = "",
     [ValidateSet("dev", "test", "prod")]
     [string]$Environment = "dev",
     [string]$UniqueSuffix = "",
@@ -70,7 +71,7 @@ function Show-FailedDeploymentOperations {
         [Parameter(Mandatory)][string]$DeploymentName
     )
 
-    Write-Host "" 
+    Write-Host ""
     Write-Host "Failed Azure deployment operations:" -ForegroundColor Yellow
 
     try {
@@ -108,6 +109,13 @@ $account = Invoke-AzJson -Arguments @("account", "show")
 Write-Host "Subscription: $($account.name)" -ForegroundColor Green
 Write-Host "Tenant:       $($account.tenantId)" -ForegroundColor Green
 
+if ([string]::IsNullOrWhiteSpace($SearchLocation)) {
+    $SearchLocation = $Location
+}
+
+Write-Host "Primary region: $Location" -ForegroundColor Green
+Write-Host "Search region:  $SearchLocation" -ForegroundColor Green
+
 Write-Host "Checking Flex Consumption regional availability..." -ForegroundColor Cyan
 $flexLocations = Invoke-AzJson -Arguments @("functionapp", "list-flexconsumption-locations")
 $locationSupported = $flexLocations | Where-Object { $_.name -eq $Location }
@@ -115,7 +123,7 @@ if (-not $locationSupported) {
     Write-Host "Flex Consumption is not available in '$Location'." -ForegroundColor Red
     Write-Host "Supported regions:" -ForegroundColor Yellow
     $flexLocations | Sort-Object name | Select-Object -ExpandProperty name
-    throw "Choose a supported region and rerun the script. Do not request B1/Bsv2 quota for this architecture."
+    throw "Choose a supported primary region and rerun the script. Do not request B1/Bsv2 quota for this architecture."
 }
 
 Write-Host "Checking Python $PythonVersion availability in $Location..." -ForegroundColor Cyan
@@ -227,13 +235,14 @@ if ($LASTEXITCODE -ne 0) {
 
 $parameters = @(
     "location=$Location",
+    "searchLocation=$SearchLocation",
     "environment=$Environment",
     "uniqueSuffix=$UniqueSuffix",
     "deployModels=false",
     "functionPythonVersion=$PythonVersion"
 )
 
-Write-Host "Running Azure what-if for resource location '$Location'..." -ForegroundColor Cyan
+Write-Host "Running Azure what-if (primary '$Location', Search '$SearchLocation')..." -ForegroundColor Cyan
 $whatIfArgs = @(
     "deployment", "group", "what-if",
     "--resource-group", $ResourceGroup,
@@ -251,12 +260,12 @@ if (-not $Deploy) {
     Write-Host "Preflight and what-if completed successfully." -ForegroundColor Green
     Write-Host "No infrastructure was deployed." -ForegroundColor Yellow
     Write-Host "Review the what-if output, then deploy with:" -ForegroundColor Cyan
-    Write-Host ".\scripts\deploy-phase1a-serverless.ps1 -ResourceGroup '$ResourceGroup' -Location '$Location' -Environment '$Environment' -UniqueSuffix '$UniqueSuffix' -PythonVersion '$PythonVersion' -Deploy"
+    Write-Host ".\scripts\deploy-phase1a-serverless.ps1 -ResourceGroup '$ResourceGroup' -Location '$Location' -SearchLocation '$SearchLocation' -Environment '$Environment' -UniqueSuffix '$UniqueSuffix' -PythonVersion '$PythonVersion' -Deploy"
     exit 0
 }
 
 $deploymentName = "phase1a-serverless"
-Write-Host "Deploying Phase 1A serverless foundation to '$Location'..." -ForegroundColor Cyan
+Write-Host "Deploying Phase 1A serverless foundation (primary '$Location', Search '$SearchLocation')..." -ForegroundColor Cyan
 $deploymentArgs = @(
     "deployment", "group", "create",
     "--resource-group", $ResourceGroup,
