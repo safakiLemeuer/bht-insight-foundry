@@ -19,6 +19,84 @@ function Assert-Command {
     }
 }
 
+function Invoke-AzWithRetry {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [int]$MaxAttempts = 6,
+        [int]$InitialDelaySeconds = 5
+    )
+
+    $delay = $InitialDelaySeconds
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $stdoutFile = [System.IO.Path]::GetTempFileName()
+        $stderrFile = [System.IO.Path]::GetTempFileName()
+
+        try {
+            & az @Arguments 1>$stdoutFile 2>$stderrFile
+            $exitCode = $LASTEXITCODE
+            $stdout = Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue
+            $stderr = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
+
+            if ($exitCode -eq 0) {
+                return [pscustomobject]@{
+                    ExitCode = 0
+                    StdOut = $stdout
+                    StdErr = $stderr
+                }
+            }
+
+            $combined = "$stdout`n$stderr"
+            $isTransient = (
+                $combined -match '10054' -or
+                $combined -match 'ConnectionResetError' -or
+                $combined -match 'Connection aborted' -or
+                $combined -match 'forcibly closed by the remote host' -or
+                $combined -match 'RemoteDisconnected' -or
+                $combined -match 'temporarily unavailable' -or
+                $combined -match 'timed out' -or
+                $combined -match 'TimeoutError'
+            )
+
+            if (-not $isTransient -or $attempt -eq $MaxAttempts) {
+                return [pscustomobject]@{
+                    ExitCode = $exitCode
+                    StdOut = $stdout
+                    StdErr = $stderr
+                }
+            }
+
+            Write-Warning "Transient Azure CLI/network failure on attempt $attempt/$MaxAttempts. Retrying in $delay seconds..."
+            Start-Sleep -Seconds $delay
+            $delay = [Math]::Min($delay * 2, 30)
+        }
+        finally {
+            Remove-Item $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Convert-AzJsonResult {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$OperationLabel
+    )
+
+    if ($Result.ExitCode -ne 0) {
+        $details = ($Result.StdErr | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($details)) {
+            $details = ($Result.StdOut | Out-String).Trim()
+        }
+        throw "$OperationLabel failed.`n$details"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Result.StdOut)) {
+        return $null
+    }
+
+    return $Result.StdOut | ConvertFrom-Json
+}
+
 Assert-Command az
 
 $prefix = "bhtinsight-$Environment-$UniqueSuffix"
@@ -31,32 +109,47 @@ Write-Host "Function: $functionAppName" -ForegroundColor Green
 Write-Host "Foundry:  $foundryName" -ForegroundColor Green
 Write-Host "Search:   $searchName / $IndexName" -ForegroundColor Green
 
-$function = (& az functionapp show `
-    --resource-group $ResourceGroup `
-    --name $functionAppName `
-    --output json | Out-String) | ConvertFrom-Json
+Write-Host "Verifying Function App..." -ForegroundColor Cyan
+$functionResult = Invoke-AzWithRetry -Arguments @(
+    "functionapp", "show",
+    "--resource-group", $ResourceGroup,
+    "--name", $functionAppName,
+    "--output", "json"
+)
 
-if ($LASTEXITCODE -ne 0 -or $null -eq $function) {
-    throw "Function App '$functionAppName' was not found."
+if ($functionResult.ExitCode -ne 0) {
+    $details = "$($functionResult.StdOut)`n$($functionResult.StdErr)"
+    if ($details -match 'ResourceNotFound|NotFound|could not be found') {
+        throw "Function App '$functionAppName' was not found in resource group '$ResourceGroup'."
+    }
+    throw "Unable to verify Function App '$functionAppName' because Azure CLI failed after retries.`n$details"
 }
 
-$search = (& az search service show `
-    --resource-group $ResourceGroup `
-    --name $searchName `
-    --output json | Out-String) | ConvertFrom-Json
-
-if ($LASTEXITCODE -ne 0 -or $null -eq $search) {
-    throw "Search service '$searchName' was not found."
+$function = Convert-AzJsonResult -Result $functionResult -OperationLabel "Function App lookup"
+if ($null -eq $function) {
+    throw "Function App lookup returned no data for '$functionAppName'."
 }
 
-$deployments = (& az cognitiveservices account deployment list `
-    --resource-group $ResourceGroup `
-    --name $foundryName `
-    --output json | Out-String) | ConvertFrom-Json
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to verify Foundry model deployments."
+Write-Host "Verifying Azure AI Search service..." -ForegroundColor Cyan
+$searchResult = Invoke-AzWithRetry -Arguments @(
+    "search", "service", "show",
+    "--resource-group", $ResourceGroup,
+    "--name", $searchName,
+    "--output", "json"
+)
+$search = Convert-AzJsonResult -Result $searchResult -OperationLabel "Search service lookup"
+if ($null -eq $search) {
+    throw "Search service lookup returned no data for '$searchName'."
 }
+
+Write-Host "Verifying Foundry model deployments..." -ForegroundColor Cyan
+$deploymentsResult = Invoke-AzWithRetry -Arguments @(
+    "cognitiveservices", "account", "deployment", "list",
+    "--resource-group", $ResourceGroup,
+    "--name", $foundryName,
+    "--output", "json"
+)
+$deployments = Convert-AzJsonResult -Result $deploymentsResult -OperationLabel "Foundry deployment lookup"
 
 $chat = @($deployments | Where-Object { $_.name -eq "chat-bht-insight" -and $_.properties.provisioningState -eq "Succeeded" })
 $embedding = @($deployments | Where-Object { $_.name -eq "embed-bht-insight" -and $_.properties.provisioningState -eq "Succeeded" })
@@ -68,21 +161,22 @@ $openAiEndpoint = "https://$foundryName.openai.azure.com"
 $searchEndpoint = "https://$searchName.search.windows.net"
 
 Write-Host "Updating non-secret application settings..." -ForegroundColor Cyan
-& az functionapp config appsettings set `
-    --resource-group $ResourceGroup `
-    --name $functionAppName `
-    --settings `
-        AZURE_OPENAI_ENDPOINT=$openAiEndpoint `
-        AZURE_OPENAI_API_VERSION=2024-10-21 `
-        AZURE_OPENAI_CHAT_DEPLOYMENT=chat-bht-insight `
-        AZURE_OPENAI_EMBEDDING_DEPLOYMENT=embed-bht-insight `
-        AZURE_SEARCH_ENDPOINT=$searchEndpoint `
-        AZURE_SEARCH_INDEX=$IndexName `
-        RAG_RETRIEVAL_TOP_K=5 `
-    --output none
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Unable to update Function App application settings."
+$appSettingsResult = Invoke-AzWithRetry -Arguments @(
+    "functionapp", "config", "appsettings", "set",
+    "--resource-group", $ResourceGroup,
+    "--name", $functionAppName,
+    "--settings",
+    "AZURE_OPENAI_ENDPOINT=$openAiEndpoint",
+    "AZURE_OPENAI_API_VERSION=2024-10-21",
+    "AZURE_OPENAI_CHAT_DEPLOYMENT=chat-bht-insight",
+    "AZURE_OPENAI_EMBEDDING_DEPLOYMENT=embed-bht-insight",
+    "AZURE_SEARCH_ENDPOINT=$searchEndpoint",
+    "AZURE_SEARCH_INDEX=$IndexName",
+    "RAG_RETRIEVAL_TOP_K=5",
+    "--output", "none"
+)
+if ($appSettingsResult.ExitCode -ne 0) {
+    throw "Unable to update Function App application settings after retries.`n$($appSettingsResult.StdErr)"
 }
 
 $requiredPaths = @(
@@ -117,32 +211,40 @@ Write-Host "Creating deployment package..." -ForegroundColor Cyan
 Compress-Archive -Path "$buildRoot\*" -DestinationPath $zipPath -CompressionLevel Optimal
 
 Write-Host "Deploying to Flex Consumption with remote Python build..." -ForegroundColor Cyan
-& az functionapp deployment source config-zip `
-    --resource-group $ResourceGroup `
-    --name $functionAppName `
-    --src $zipPath `
-    --build-remote true `
-    --timeout 1200 `
-    --output none
+$deployResult = Invoke-AzWithRetry -Arguments @(
+    "functionapp", "deployment", "source", "config-zip",
+    "--resource-group", $ResourceGroup,
+    "--name", $functionAppName,
+    "--src", $zipPath,
+    "--build-remote", "true",
+    "--timeout", "1200",
+    "--output", "none"
+) -MaxAttempts 4 -InitialDelaySeconds 10
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Function App package deployment failed."
+if ($deployResult.ExitCode -ne 0) {
+    throw "Function App package deployment failed after retries.`n$($deployResult.StdErr)"
 }
 
-$hostName = (& az functionapp show `
-    --resource-group $ResourceGroup `
-    --name $functionAppName `
-    --query defaultHostName `
-    --output tsv).Trim()
+$hostResult = Invoke-AzWithRetry -Arguments @(
+    "functionapp", "show",
+    "--resource-group", $ResourceGroup,
+    "--name", $functionAppName,
+    "--query", "defaultHostName",
+    "--output", "tsv"
+)
+if ($hostResult.ExitCode -ne 0) {
+    throw "Deployment succeeded, but the Function App hostname lookup failed after retries.`n$($hostResult.StdErr)"
+}
 
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($hostName)) {
+$hostName = ($hostResult.StdOut | Out-String).Trim()
+if ([string]::IsNullOrWhiteSpace($hostName)) {
     throw "Deployment succeeded but the Function App hostname could not be resolved."
 }
 
 $healthUri = "https://$hostName/health"
 Write-Host "Waiting for API health endpoint..." -ForegroundColor Cyan
 $healthy = $false
-for ($attempt = 1; $attempt -le 12; $attempt++) {
+for ($attempt = 1; $attempt -le 18; $attempt++) {
     try {
         $response = Invoke-RestMethod -Method Get -Uri $healthUri -TimeoutSec 20
         if ($response.status -eq "healthy") {
@@ -151,6 +253,7 @@ for ($attempt = 1; $attempt -le 12; $attempt++) {
         }
     }
     catch {
+        Write-Host "  Health check $attempt/18 not ready; retrying..." -ForegroundColor DarkGray
         Start-Sleep -Seconds 10
     }
 }
@@ -159,7 +262,7 @@ if (-not $healthy) {
     throw "Function package deployed, but '$healthUri' did not become healthy within the validation window."
 }
 
-Write-Host "" 
+Write-Host ""
 Write-Host "Phase 1A Function API deployed and healthy." -ForegroundColor Green
 Write-Host "  Health: $healthUri" -ForegroundColor DarkGray
 Write-Host "  Ask:    https://$hostName/ask" -ForegroundColor DarkGray
