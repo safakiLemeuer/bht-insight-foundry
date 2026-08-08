@@ -109,26 +109,41 @@ Write-Host "Function: $functionAppName" -ForegroundColor Green
 Write-Host "Foundry:  $foundryName" -ForegroundColor Green
 Write-Host "Search:   $searchName / $IndexName" -ForegroundColor Green
 
-Write-Host "Verifying Function App..." -ForegroundColor Cyan
+Write-Host "Reading active subscription..." -ForegroundColor Cyan
+$accountResult = Invoke-AzWithRetry -Arguments @("account", "show", "--output", "json")
+$account = Convert-AzJsonResult -Result $accountResult -OperationLabel "Azure subscription lookup"
+if ($null -eq $account -or [string]::IsNullOrWhiteSpace($account.id)) {
+    throw "Unable to resolve the active Azure subscription."
+}
+$subscriptionId = $account.id
+
+# Use generic ARM REST for Function App lookup. This avoids the Azure CLI App Service
+# custom command path that repeatedly fails TLS handshakes on some Windows installations.
+$functionResourceId = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$functionAppName"
+$functionApiVersion = "2023-12-01"
+
+Write-Host "Verifying Function App through ARM REST..." -ForegroundColor Cyan
 $functionResult = Invoke-AzWithRetry -Arguments @(
-    "functionapp", "show",
-    "--resource-group", $ResourceGroup,
-    "--name", $functionAppName,
+    "rest",
+    "--method", "get",
+    "--url", "https://management.azure.com$functionResourceId?api-version=$functionApiVersion",
     "--output", "json"
 )
 
 if ($functionResult.ExitCode -ne 0) {
     $details = "$($functionResult.StdOut)`n$($functionResult.StdErr)"
-    if ($details -match 'ResourceNotFound|NotFound|could not be found') {
+    if ($details -match 'ResourceNotFound|NotFound|could not be found|404') {
         throw "Function App '$functionAppName' was not found in resource group '$ResourceGroup'."
     }
-    throw "Unable to verify Function App '$functionAppName' because Azure CLI failed after retries.`n$details"
+    throw "Unable to verify Function App '$functionAppName' through ARM REST after retries.`n$details"
 }
 
-$function = Convert-AzJsonResult -Result $functionResult -OperationLabel "Function App lookup"
+$function = Convert-AzJsonResult -Result $functionResult -OperationLabel "Function App ARM lookup"
 if ($null -eq $function) {
-    throw "Function App lookup returned no data for '$functionAppName'."
+    throw "Function App ARM lookup returned no data for '$functionAppName'."
 }
+
+Write-Host "  Function state: $($function.properties.state)" -ForegroundColor Green
 
 Write-Host "Verifying Azure AI Search service..." -ForegroundColor Cyan
 $searchResult = Invoke-AzWithRetry -Arguments @(
@@ -225,18 +240,23 @@ if ($deployResult.ExitCode -ne 0) {
     throw "Function App package deployment failed after retries.`n$($deployResult.StdErr)"
 }
 
-$hostResult = Invoke-AzWithRetry -Arguments @(
-    "functionapp", "show",
-    "--resource-group", $ResourceGroup,
-    "--name", $functionAppName,
-    "--query", "defaultHostName",
-    "--output", "tsv"
-)
-if ($hostResult.ExitCode -ne 0) {
-    throw "Deployment succeeded, but the Function App hostname lookup failed after retries.`n$($hostResult.StdErr)"
+# Reuse the ARM resource already read above for the hostname. If the platform did not
+# return a hostname in that response, refresh it through ARM REST rather than functionapp show.
+$hostName = $function.properties.defaultHostName
+if ([string]::IsNullOrWhiteSpace($hostName)) {
+    $hostResult = Invoke-AzWithRetry -Arguments @(
+        "rest",
+        "--method", "get",
+        "--url", "https://management.azure.com$functionResourceId?api-version=$functionApiVersion",
+        "--query", "properties.defaultHostName",
+        "--output", "tsv"
+    )
+    if ($hostResult.ExitCode -ne 0) {
+        throw "Deployment succeeded, but the Function App hostname ARM lookup failed after retries.`n$($hostResult.StdErr)"
+    }
+    $hostName = ($hostResult.StdOut | Out-String).Trim()
 }
 
-$hostName = ($hostResult.StdOut | Out-String).Trim()
 if ([string]::IsNullOrWhiteSpace($hostName)) {
     throw "Deployment succeeded but the Function App hostname could not be resolved."
 }
