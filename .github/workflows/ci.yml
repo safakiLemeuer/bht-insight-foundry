@@ -17,6 +17,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Compile Bicep infrastructure
+        uses: azure/cli@v2
+        with:
+          inlineScript: az bicep build --file infra/bicep/main.bicep --stdout > /dev/null
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
