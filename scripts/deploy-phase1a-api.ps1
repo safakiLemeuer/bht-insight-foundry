@@ -121,12 +121,14 @@ $subscriptionId = $account.id
 # custom command path that repeatedly fails TLS handshakes on some Windows installations.
 $functionResourceId = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$functionAppName"
 $functionApiVersion = "2023-12-01"
+$functionArmUrl = "https://management.azure.com${functionResourceId}?api-version=${functionApiVersion}"
 
 Write-Host "Verifying Function App through ARM REST..." -ForegroundColor Cyan
 $functionResult = Invoke-AzWithRetry -Arguments @(
     "rest",
     "--method", "get",
-    "--url", "https://management.azure.com$functionResourceId?api-version=$functionApiVersion",
+    "--url", $functionArmUrl,
+    "--resource", "https://management.azure.com/",
     "--output", "json"
 )
 
@@ -247,7 +249,8 @@ if ([string]::IsNullOrWhiteSpace($hostName)) {
     $hostResult = Invoke-AzWithRetry -Arguments @(
         "rest",
         "--method", "get",
-        "--url", "https://management.azure.com$functionResourceId?api-version=$functionApiVersion",
+        "--url", $functionArmUrl,
+        "--resource", "https://management.azure.com/",
         "--query", "properties.defaultHostName",
         "--output", "tsv"
     )
